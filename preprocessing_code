@@ -1,0 +1,1374 @@
+import findspark
+
+findspark.init()
+
+import os
+import sys
+import boto3
+import fnmatch
+import traceback
+import pathlib
+import psutil
+import paramiko
+import shutil
+import json
+import argparse
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from s3fs.core import S3FileSystem
+from boto3.s3.transfer import TransferConfig
+
+
+def get_spark_parameters():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--executor_instances')
+    parser.add_argument('--executor_cores')
+    parser.add_argument('--executor_memory')
+    parser.add_argument('--shuffle_partitions')
+    parser.add_argument('--driver_memory')
+    parser.add_argument('--executor_memory_overhead')
+    return vars(parser.parse_args())
+
+
+class FCM:
+    def __init__(self, wf_var, src_loc, path):
+        self.wf_var = wf_var
+        self.orig_src_loc = src_loc
+        self.credentials = self.fetch_credentials(src_loc)
+        self.path = FCM._process_path(path)
+        self.src_loc = 's3' if 'S3' in src_loc else 'sftp'
+        self.fs = self.connect()
+
+    def connect(self):
+        # only makeing for s3 please update to dynamic
+        if len(self.credentials['access_key']) == 0:
+            fs = S3FileSystem(anon=False)
+        elif len(self.credentials['session_token']) == 0:
+            fs = S3FileSystem(anon=False, key=self.credentials['access_key'],
+                              secret=self.credentials['secret_key'])
+        else:
+            fs = S3FileSystem(anon=False, key=self.credentials['access_key'],
+                              secret=self.credentials['secret_key'],
+                              token=self.credentials['session_token'])
+        return fs
+
+    def file_source_params(self, src_loc):
+        src = dict()
+        if 'S3' in src_loc:  # 's3' in src_loc or src_loc == 'tdec-int'
+            src = {
+                "environment": "PROD",
+                "environment_logging": "",
+                "access_key": "",
+                "secret_key": "",
+                "session_token": "",
+                "assume_role_arn": "",
+                "assume_role_flag": "N",
+                "bucket_name": "",
+                "region": "us-east-1"
+            }
+        elif 'SFTP' in src_loc:  # 'ftp' in src_loc or src_loc == 'tdec-ext'
+            src = {
+                "environment": "PROD",
+                "environment_logging": "",
+                "host": "",
+                "username": "",
+                "password": "",
+                "port": "22",
+                "known_hosts": ""
+            }
+        else:
+            raise Exception(f"Provided {src_loc} is not in the list ['s3','sftp','tdec-int','tdec-ext']")
+        return src
+
+    def sm_connection(self, src_loc):
+        sm_client = boto3.client('secretsmanager', region_name='us-east-1')
+        sm_response = sm_client.get_secret_value(
+            SecretId='arn:aws:secretsmanager:us-east-1:297820783768:secret:aws-a8101-use1-00-p-secm-shrd-6004-key02-5mG5ta')
+        secret_str = sm_response['SecretString']
+        secret_str = json.loads(secret_str)
+        return secret_str[src_loc]
+
+    def dev_sm_connection(self, src_loc):
+        secret_str = {
+            "PZS3": {
+                "bucket_name": "s3://aws-a8101-use1-00-d-s3b-asts-pdm-data01",
+                "assume_role_arn": "arn:aws:iam::297820783768:role/aws-a8101-glbl-00-d-rol-asts-6004-s301",
+                "assume_role_flag": "Y",
+                "region": "us-east-1"
+            }
+        }
+        return secret_str[src_loc]
+
+    def fetch_assume_role_credentials(self, src):
+        if len(src['assume_role_arn']) == 0 and src['assume_role_flag'].upper() == "Y":
+            error = f" ERROR MESSAGE: Invalid Assumed-Role ARN string (For Bucket: {src['bucket_name']})" + str(
+                traceback.format_exc())
+            print(error)
+            raise Exception(error)
+        elif src['assume_role_flag'].upper() == "Y":
+            sts_client = boto3.client('sts')
+            assumed_role_object = sts_client.assume_role(
+                RoleArn=src['assume_role_arn'],
+                RoleSessionName="AssumeRoleSession1"
+            )
+            creds = assumed_role_object['Credentials']
+            src["access_key"] = creds['AccessKeyId']
+            src["secret_key"] = creds['SecretAccessKey']
+            src["session_token"] = creds['SessionToken']
+        print(str(src))
+        return src
+
+    def fetch_credentials(self, src_loc):
+        src = self.file_source_params(src_loc)
+
+        src_creds = self.dev_sm_connection(src_loc)
+        for key in src_creds.keys():
+            src[key] = src_creds[key]
+
+        if "S3" in src_loc and src['assume_role_flag'].upper() == "Y":
+            src = self.fetch_assume_role_credentials(src)
+
+        return src
+
+    def detect_encoding(self, file_name):
+        from codecs import BOM_UTF8, BOM_UTF16_BE, BOM_UTF16_LE, BOM_UTF32_BE, BOM_UTF32_LE
+
+        #: mapping of BOM beginnings to the type of file encoding they represent - the encoding for any file beginning
+        #: with specific BOM character can be easily classified.
+        BOMS = (
+            (BOM_UTF8, "utf_8_sig"),
+            (BOM_UTF32_BE, "utf_32_be"),
+            (BOM_UTF32_LE, "utf_32_le"),
+            (BOM_UTF16_BE, "utf_16_be"),
+            (BOM_UTF16_LE, "utf_16_le"),
+        )
+        if self.src_loc == 's3' or self.src_loc == 'sftp':
+            file_handler_read = self.fs.open(file_name, 'rb')
+        else:
+            file_handler_read = self.fs.open('rb')
+
+        #: reading the first ten bytes of file in memory to check for BOM character.
+        ten_bytes = file_handler_read.read(10)
+        bom_encs = [encoding for bom, encoding in BOMS if ten_bytes.startswith(bom)]
+        if len(bom_encs) != 0:
+            return bom_encs[0]
+        file_handler_read.seek(0)
+        usable_memory = psutil.virtual_memory().free / 2
+        chunksize = int(usable_memory / 20)
+
+        def generator(data):
+            data.seek(0)
+            while True:
+                ch = data.read(chunksize)
+                if ch:
+                    yield ch
+                else:
+                    return
+
+        #: List of encodings which are checked against in a particular order.
+        list_of_encodings = ['ascii', 'cp1250', 'cp1251', 'cp1252', 'utf_8', 'utf_8_sig', 'utf_16', 'utf_16_be',
+                             'utf_16_le', 'utf_32', 'utf_32_be', 'utf_32_le', 'latin_1']
+        import codecs
+
+        def sniff(data):
+            for enc in list_of_encodings:
+                try:
+                    for done in codecs.iterdecode(generator(data), enc):
+                        continue
+                except UnicodeDecodeError:
+                    continue
+                except UnicodeError:
+                    continue
+                else:
+                    return enc
+
+        return sniff(file_handler_read)
+
+    def read(self, srch_pttrn, dlmtr=None, sht_nm=None, txt_qlfr=None, header='infer', skip_row=0, row_level_read=False,
+             date_format=None, encoding=None, chunksize=None):
+        try:
+            import csv
+            if self.path == '' or srch_pttrn == '':
+                raise Exception('Source path or search pattern for file is blank or has value None')
+            #: Search for the file using the :meth:`~patient_hub.utilities.FileConnectionManager.FileConnectionManager.find`
+            #: method and store the full file name
+            file_name = str(self.find(srch_pttrn, date_format))
+            extnsn = '.' + file_name.rpartition('.')[-1]
+            quoting = csv.QUOTE_MINIMAL
+            # parsing and validating arguments
+            if extnsn == '.xlsx' or extnsn == '.xlsb' or extnsn == '.xlsm' or extnsn == '.xls':
+                if sht_nm == '' or sht_nm is None or header == '' or skip_row == '' or skip_row is None:
+                    raise Exception('Provide non-blank/non-None arguments to read Excel file')
+            elif extnsn == '.txt' or extnsn == '.csv' or extnsn == '.TXT' or extnsn == '.pgp':
+                if (
+                        dlmtr == '' or dlmtr is None or header == '' or skip_row == '' or skip_row is None) and not row_level_read:
+                    raise Exception('Provide non-blank/non-None arguments to read csv or text files')
+                if txt_qlfr == '' or txt_qlfr is None:
+                    quoting = csv.QUOTE_NONE
+            # setting the complete path (including file name) and opening file.
+            if self.src_loc == 'local':
+                self.fs = self.fs / file_name
+            if encoding is None:
+                encoding = self.detect_encoding(file_name)
+                self.encoding = encoding
+            else:
+                self.encoding = encoding
+            if self.src_loc == 's3' or self.src_loc == 'sftp':
+                file_handler_binary = self.fs.open(file_name, 'rb')
+            else:
+                file_handler_binary = self.fs.open('rb')
+                self.fs = self.fs.parent
+            if row_level_read:
+                chunksize = 1
+            else:
+                if chunksize is None:
+                    usable_memory = psutil.virtual_memory().free / 9
+                    chunksize = int(usable_memory / 500000)
+            # reading file using pandas.read_excel for excel files and pandas.read_csv for flat files.
+            if extnsn == '.xlsx' or extnsn == '.xlsb' or extnsn == '.xlsm' or extnsn == '.xls':
+                skip_rows = skip_row
+                while True:
+                    if skip_row == float('inf'):
+                        # if the command says to skip infinite rows, then it is a flag to just open the excel file and
+                        # check if the sheet exists or not. Using openpyxl for this purpose.
+                        import openpyxl
+                        if sht_nm in openpyxl.load_workbook(file_handler_binary, read_only=True).sheetnames:
+                            return True
+                        else:
+                            return False
+                    if header == 'infer':
+                        header = 0
+                    chunk = pd.read_excel(file_handler_binary, sheet_name=sht_nm, nrows=chunksize, skiprows=skip_rows,
+                                          header=header, dtype='str', keep_default_na=False)
+                    df = pd.DataFrame(chunk)
+                    if df.shape[0] != 0:
+                        skip_rows += chunksize
+                        yield df
+                    else:
+                        break
+            else:
+                if not row_level_read:
+                    data_chunks = pd.read_csv(file_handler_binary, sep=dlmtr, encoding=encoding,
+                                              chunksize=chunksize, skiprows=skip_row, quoting=quoting,
+                                              quotechar=txt_qlfr, header=header, dtype=object,
+                                              keep_default_na=False, na_values=[''])
+                    for chunk in data_chunks:
+                        yield chunk
+                else:
+                    # using simple python file handling operation for row level reading of flat files.
+                    skipped = 0
+                    for line in file_handler_binary:
+                        if skipped < skip_row:
+                            skipped += 1
+                            continue
+                        yield line.decode(encoding)
+        except Exception as exception:
+            error = " ERROR MESSAGE: " + str(traceback.format_exc())
+            print(error)
+            raise exception
+
+    def find(self, srch_pttrn, date_format=None, return_all=False):
+        try:
+            from datetime import datetime
+            start_pos = -1
+            # i = -1
+            files_to_move = []
+            f_name = None
+            # cannot loctate the date_format placeholder if * is in search pattern due to variable number of characters
+            if '*' in srch_pttrn:
+                date_format = None
+            # mapping the date_format entered in SQL to date_format supported by python.
+            if date_format is not None:
+                mapping = {
+                    'DD': '%d',
+                    'MM': '%m',
+                    'YY': '%y',
+                    'YYYY': '%Y',
+                    '%y%y': '%Y',
+                    'hh': '%H',
+                    'mm': '%M',
+                    'ss': '%S'
+                }
+                for key in mapping.keys():
+                    date_format = date_format.replace(key, mapping[key])
+            for spttrn in srch_pttrn.split(","):
+                sp = spttrn.strip()
+                if self.src_loc == 's3':
+                    loc_s3 = self.credentials['bucket_name'] + "/" + self.path
+                    files = self.fs.ls(loc_s3, detail=False)
+                    for file in files:
+                        file_nm = file.split('/')[-1]
+                        if fnmatch.fnmatchcase(file_nm, sp):
+                            dates = []
+                            i = -1
+                            for ch in sp:
+                                i += 1
+                                if ch == '?':
+                                    if start_pos < 0:
+                                        start_pos = i
+                                else:
+                                    if start_pos > -1:
+                                        dates.append((start_pos, i))
+                                        start_pos = -1
+                            if start_pos > -1:
+                                dates.append((start_pos, i + 1))
+                                start_pos = -1
+                            for i, j in dates:
+                                dt = file_nm[i:j]
+                                if date_format is None:
+                                    if not dt.isdigit():
+                                        raise Exception('Dates contain alphabets: ' + file_nm)
+                                else:
+                                    # try to convert the characters at date placeholder position to a date using
+                                    # specific date-format, and fail if not able to parse date.
+                                    try:
+                                        datetime.strptime(dt, date_format)
+                                    except ValueError as e:
+                                        raise Exception('DateFormat doesnt match for file: ' + file_nm)
+                            if not return_all:
+                                if f_name is None:
+                                    f_name = 's3://' + file
+                                else:
+                                    raise Exception(
+                                        'More than one file with the same search pattern present on the location. Search pattern - ' + str(
+                                            srch_pttrn))
+                            else:
+                                files_to_move.append(file.partition('/')[2])
+
+                else:
+                    if self.src_loc == 'sftp':
+                        files = self.fs.listdir(self.path)
+                    else:
+                        files = [x.name for x in self.fs.glob('*')]
+                    for file in files:
+                        if fnmatch.fnmatchcase(file, sp):
+                            dates = []
+                            i = -1
+                            for ch in sp:
+                                i += 1
+                                if ch == '?':
+                                    if start_pos < 0:
+                                        start_pos = i
+                                else:
+                                    if start_pos > -1:
+                                        dates.append((start_pos, i))
+                                        start_pos = -1
+                            if start_pos > -1:
+                                dates.append((start_pos, i + 1))
+                                start_pos = -1
+                            for i, j in dates:
+                                dt = file[i:j]
+                                if date_format is None:
+                                    if not dt.isdigit():
+                                        raise Exception('Dates contain alphabets: ' + file)
+                                else:
+                                    try:
+                                        datetime.strptime(dt, date_format)
+                                    except ValueError as e:
+                                        raise Exception('DateFormat doesnt match for file: ' + file)
+                            if not return_all:
+                                if f_name is None:
+                                    f_name = self.path + file
+                                else:
+                                    raise Exception(
+                                        'More than one file with the same search pattern present on the location. Search pattern - ' + str(
+                                            srch_pttrn))
+                            else:
+                                files_to_move.append(self.path + file)
+            if return_all:
+                return files_to_move
+            elif f_name is not None:
+                return f_name
+            raise Exception('No file present at source location with given search pattern -- ' + srch_pttrn)
+        except Exception as exception:
+            raise exception
+
+    def get_location(self):
+        return self.src_loc, self.path
+
+    def get_s3_connection(self):
+        if len(self.credentials['access_key']) == 0:
+            return boto3.client('s3', region_name=self.credentials['region']), self.credentials['bucket_name']
+        elif len(self.credentials['session_token']) == 0:
+            return boto3.client('s3', aws_access_key_id=self.credentials['access_key'],
+                                aws_secret_access_key=self.credentials['secret_key'],
+                                region_name=self.credentials['region']), self.credentials['bucket_name']
+        else:
+            return boto3.client('s3', aws_access_key_id=self.credentials['access_key'],
+                                aws_secret_access_key=self.credentials['secret_key'],
+                                aws_session_token=self.credentials['session_token'],
+                                region_name=self.credentials['region']), self.credentials['bucket_name']
+
+    def misc(self, files):
+        # misc_path = 'MISC/ARCHIVE_' + str(self.execution_context.get_context_param('PHAS_ID')) + '/' #
+        misc_path = f'MISC/ARCHIVE_{datetime.now().strftime("%Y%m%d%H%M%S")}/'
+        self.make_dir(misc_path)
+        if self.src_loc == 'local':
+            for file in files:
+                shutil.copy(self.path + file, self.path + misc_path + file)
+                lsize = os.path.getsize(self.path + misc_path + file)
+                rsize = os.path.getsize(self.path + file)
+                if lsize == rsize:
+                    os.remove(self.path + file)
+                else:
+                    print('Failed to move file to misc: ' + file + '. The size after copy operation does not match.')
+                    raise Exception('Failed to move file to misc: ' + file)
+
+        elif self.src_loc == 's3':
+            loc_s3 = str(self.credentials['bucket_name']) + "/" + self.path
+            for file in files:
+                try:
+                    self.fs.mv(loc_s3 + file, loc_s3 + misc_path + file)
+                except Exception as e:
+                    print('Failed to move file to misc: ' + file + '. ' + traceback.format_exc())
+                    raise Exception('Filed to move file to misc: ' + file)
+
+        elif self.src_loc == 'sftp':
+            for file in files:
+                try:
+                    self.fs.rename(self.path + file, self.path + misc_path + file)
+                except Exception as e:
+                    print('Failed to move file to misc: ' + file + '. ' + traceback.format_exc())
+                    raise Exception('Filed to move file to misc: ' + file)
+
+    def get_sftp_file(self, sftp_file, read=True):
+        transport = paramiko.Transport(self.credentials['host'], int(self.credentials['port']))
+        transport.connect(username=self.credentials['username'], password=self.credentials['password'])
+        ftp_connection = paramiko.SFTPClient.from_transport(transport)
+        if read:
+            return ftp_connection.file(self.path + sftp_file, 'rb'), ftp_connection
+        else:
+            return ftp_connection.file(self.path + sftp_file, 'wb')
+
+    def write(self, file_nm, df, dlmtr=None, sht_nm=None, txt_qlfr=None, mode='a+', header=True):
+        try:
+            import csv
+            extnsn = '.' + file_nm.rpartition('.')[-1]
+            # validate attributes
+            if extnsn == '.xlsx' or extnsn == '.xlsb' or extnsn == '.xlsm' or extnsn == '.xls':
+                if sht_nm == '' or sht_nm is None:
+                    raise Exception('Provide non-blank/non-None arguments to write in Excel file')
+            elif extnsn == '.txt' or extnsn == '.csv' or extnsn == '.TXT':
+                if dlmtr == '' or dlmtr is None:
+                    raise Exception('Provide non-blank/non-None arguments to write in csv or text files')
+            else:
+                raise Exception('Provide file name with extension')
+            if txt_qlfr is None or txt_qlfr == '':
+                quotes = csv.QUOTE_NONE
+                quote_char = ''
+            else:
+                quotes = csv.QUOTE_MINIMAL
+                quote_char = txt_qlfr
+            if self.src_loc == 's3':
+                loc_s3 = self.credentials['bucket_name'] + "/" + self.path
+                # create file if it doesn't exist
+                if not self.fs.exists(loc_s3 + file_nm):
+                    self.fs.touch(loc_s3 + file_nm)
+                f = self.fs.open(loc_s3 + file_nm, mode)
+                # f.seek(0, 2)
+                if type(df).__name__ != 'str':
+                    # if data is in a dataframe, then write into excel or flat file, according to extension.
+                    if extnsn == '.xlsx' or extnsn == '.xlsb' or extnsn == '.xlsm' or extnsn == '.xls':
+                        df.to_excel(f, sht_nm, index=False, header=header, mode=mode)
+                    elif extnsn == '.txt' or extnsn == '.csv' or extnsn == '.TXT':
+                        df.to_csv(f, sep=dlmtr, index=False, header=header, mode=mode, quoting=quotes,
+                                  quotechar=quote_char, line_terminator='\r\n')
+                elif type(df).__name__ == 'str':
+                    # if data is in a string, normal python in-built file writing function is used.
+                    f.write(df)
+                f.close()
+            # process remains same for other locations also
+            elif self.src_loc == 'local':
+                if not os.path.exists(self.path):
+                    os.makedirs(self.path)
+                if type(df).__name__ != 'str':
+                    if extnsn == '.xlsx' or extnsn == '.xlsb' or extnsn == '.xlsm' or extnsn == '.xls':
+                        if not os.path.exists(self.path + file_nm):
+                            df.to_excel(self.path + file_nm, sheet_name=sht_nm, index=False, header=header, startrow=0,
+                                        startcol=0)
+                        else:
+                            from openpyxl import load_workbook
+                            writer = pd.ExcelWriter(self.path + file_nm, engine='openpyxl')
+                            writer.book = load_workbook(self.path + file_nm)
+                            writer.sheets = dict((ws.title, ws) for ws in writer.book.worksheets)
+                            reader = pd.read_excel(self.path + file_nm, sheet_name=sht_nm)
+                            df.to_excel(writer, sheet_name=sht_nm, index=False, header=header, startrow=len(reader) + 2,
+                                        startcol=0)
+                            writer.close()
+
+                    elif extnsn == '.txt' or extnsn == '.csv' or extnsn == '.TXT':
+                        df.to_csv(self.path + file_nm, sep=dlmtr, index=False, header=header, mode=mode, quoting=quotes,
+                                  quotechar=quote_char)
+
+                elif type(df).__name__ == 'str':
+                    f = open(self.path + file_nm, mode)
+                    f.write(df)
+
+        except Exception as exception:
+            raise exception
+
+    def move(self, file_nm_pttrn='*', trgt=None, date_format=None, remove_from_source=False):
+        try:
+            if not isinstance(trgt, FCM):
+                raise Exception('Target is not a valid instance of FileConnectionManager')
+            # Extracting target system details
+            trgt_loc, trgt_path = trgt.get_location()
+            # Finding files to be moved
+            if type(file_nm_pttrn) is str:
+                files_to_move = self.find(file_nm_pttrn, date_format, True)
+            elif type(file_nm_pttrn) in [list, tuple]:
+                files_to_move = [self.find(x) for x in file_nm_pttrn]
+                files_to_move = ['/'.join(x.split('/')[3:]) for x in files_to_move]
+            else:
+                raise Exception('Invalid file name pattern. Provide a string pattern or a list of strings.')
+            # Detecting any files with same names that are already present and sending them to misc folder.
+            trgt_file_lst = trgt.list_dir()
+            trgt_file_nm_lst = [file.rpartition('/')[-1] for file in trgt_file_lst]
+            misc_file_list = list(set(trgt_file_nm_lst) & set([file.rpartition('/')[-1] for file in files_to_move]))
+            if len(misc_file_list) > 0:
+                trgt.misc(misc_file_list)
+
+            usable_memory = psutil.virtual_memory().free / 2
+            chunksize = int(usable_memory / 2000)
+            success_files = files_to_move
+            # Process outlined for one block - sub block, same in every one of them.
+            # First block : source location sftp
+            if self.src_loc == 'sftp':
+                # First sub-block : target location local
+                if trgt_loc == 'local':
+                    for sftp_file_path in files_to_move:
+                        # The pysftp library used (through the self.fs file system connection)
+                        sftp_file = sftp_file_path.rpartition('/')[-1]
+                        self.fs.get(self.path + sftp_file, trgt_path + sftp_file)
+                        # sizes read from both locations
+                        lsize = os.path.getsize(trgt_path + sftp_file)
+                        rsize = self.fs.stat(self.path + sftp_file).st_size
+                        if lsize == rsize:
+                            # Deleting file from source if the flag is True
+                            if remove_from_source:
+                                self.fs.remove(self.path + sftp_file)
+                        else:
+                            # Generating warning if size does not match.
+                            print('Failed to move file : ' + sftp_file)
+                            success_files.remove(sftp_file_path)
+                elif trgt_loc == 's3':
+                    for sftp_file_path in files_to_move:
+                        sftp_file = sftp_file_path.rpartition('/')[-1]
+                        ftp_file, ftp_connection = self.get_sftp_file(sftp_file, True)
+                        s3_connection, trgt_bucket = trgt.get_s3_connection()
+                        config = TransferConfig(multipart_threshold=1024 * 200, max_concurrency=10,
+                                                multipart_chunksize=chunksize, use_threads=True)
+                        s3_connection.upload_fileobj(ftp_file, trgt_bucket.rpartition('/')[-1],
+                                                     trgt_path + sftp_file, Config=config)
+                        ftp_file.close()
+                        lsize = s3_connection.head_object(Bucket=trgt_bucket.rpartition('/')[-1],
+                                                          Key=trgt_path + sftp_file)['ContentLength']
+                        rsize = self.fs.stat(self.path + sftp_file).st_size
+                        if lsize == rsize:
+                            if remove_from_source:
+                                self.fs.remove(self.path + sftp_file)
+                        else:
+                            print('Failed to move file : ' + sftp_file)
+                            success_files.remove(sftp_file_path)
+                elif trgt_loc == 'sftp':
+                    for sftp_file_path in files_to_move:
+                        sftp_file = sftp_file_path.rpartition('/')[-1]
+                        ftp_file, ftp_connection = self.get_sftp_file(sftp_file, True)
+                        ftp_connection.putfo(ftp_file, trgt_path + sftp_file)
+                        rsize = self.fs.stat(self.path + sftp_file).st_size
+                        lsize = self.fs.stat(trgt_path + sftp_file).st_size
+                        if lsize == rsize:
+                            if remove_from_source:
+                                self.fs.remove(self.path + sftp_file)
+                        else:
+                            print('Failed to move file : ' + sftp_file)
+                            success_files.remove(sftp_file_path)
+            elif self.src_loc == 's3':
+                loc_s3 = self.credentials['bucket_name'] + "/" + self.path
+                # if len(self.credentials['access_key']) == 0:
+                #     s3_connection = boto3.client('s3', region_name=self.credentials['region'])
+                # else:
+                #     s3_connection = boto3.client('s3', aws_access_key_id=self.credentials['access_key'],
+                #                                  aws_secret_access_key=self.credentials['secret_key'],
+                #                                  region_name=self.credentials['region'])
+                s3_connection, _bucket = self.get_s3_connection()
+                if trgt_loc == 'local':
+                    for file in files_to_move:
+                        file_nm = file.rpartition('/')[-1]
+                        if str(file.rpartition('/')[0]) == str(self.path.rpartition('/')[0]):
+                            self.fs.get(loc_s3 + file_nm, trgt_path + file_nm)
+                            lsize = os.path.getsize(trgt_path + file_nm)
+                            rsize = self.fs.info(loc_s3 + file_nm)['size']
+                            if lsize == rsize:
+                                if remove_from_source:
+                                    self.fs.rm(loc_s3 + file_nm)
+                            else:
+                                print('Failed to move file : ' + file_nm)
+                                success_files.remove(file)
+                elif trgt_loc == 's3':
+                    s3_connection1, trgt_bucket = trgt.get_s3_connection()
+                    i = 0
+                    for file in files_to_move:
+                        # print("inside")
+                        file_nm = file.rpartition('/')[-1]
+                        print('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaMoving file', file_nm, self.path, trgt_path,
+                              self.credentials['bucket_name'].rpartition('/')[-1], trgt_bucket.rpartition('/')[-1])
+                        if str(file.rpartition('/')[0]) == str(self.path.rpartition('/')[0]):
+                            obj = s3_connection.get_object(Bucket=self.credentials['bucket_name'].rpartition('/')[-1],
+                                                           Key=self.path + file_nm)
+                            import time
+                            strt = time.time()
+                            resp = s3_connection1.upload_fileobj(obj['Body'], trgt_bucket.rpartition('/')[-1],
+                                                                 trgt_path + file_nm)
+                            print('tttttttttttttttime ' + str(file_nm), time.time() - strt)
+                            print('bbbbbbbbbbbbbbbbbbbbbbb', resp)
+                            lsize = s3_connection1.head_object(Bucket=trgt_bucket.rpartition('/')[-1],
+                                                               Key=trgt_path + file_nm)['ContentLength']
+                            rsize = \
+                                s3_connection.head_object(Bucket=self.credentials['bucket_name'].rpartition('/')[-1],
+                                                          Key=self.path + file_nm)['ContentLength']
+                            print('llllllllllllll', lsize, rsize)
+                            if lsize == rsize:
+                                if remove_from_source:
+                                    # print("removing")
+                                    self.fs.rm(loc_s3 + file_nm)
+                            else:
+                                print('Failed to move file : ' + file)
+                                success_files.remove(file)
+                elif trgt_loc == 'sftp':
+                    for file in files_to_move:
+                        file_nm = file.rpartition('/')[-1]
+                        ftp_file = trgt.get_sftp_file(file_nm, False)
+                        config = TransferConfig(multipart_threshold=1024 * 200, max_concurrency=10,
+                                                multipart_chunksize=chunksize, use_threads=True)
+                        if str(file.rpartition('/')[0]) == str(self.path.rpartition('/')[0]):
+                            sftp_fs = trgt.get_sftp_filesys()
+                            obj = s3_connection.get_object(Bucket=self.credentials['bucket_name'].rpartition('/')[-1],
+                                                           Key=self.path + file_nm)
+                            body = obj['Body'].read()
+                            # sftp_fs.putfo(body, trgt_path + file_nm)
+                            ftp_file.write(body)
+                            ftp_file.close()
+                            lsize = sftp_fs.stat(trgt_path + file_nm).st_size
+                            rsize = \
+                                s3_connection.head_object(Bucket=self.credentials['bucket_name'].rpartition('/')[-1],
+                                                          Key=self.path + file_nm)['ContentLength']
+                            if lsize == rsize:
+                                if remove_from_source:
+                                    self.fs.rm(loc_s3 + file_nm)
+                            else:
+                                print('Failed to move file : ' + file)
+                                success_files.remove(file)
+
+            elif self.src_loc == 'local':
+                import shutil
+                if trgt_loc == 'local':
+                    for file in files_to_move:
+                        file_nm = file.rpartition('/')[-1]
+                        shutil.copy(self.path + file_nm, trgt_path + file_nm)
+                        lsize = os.path.getsize(trgt_path + file_nm)
+                        rsize = os.path.getsize(self.path + file_nm)
+                        if lsize == rsize:
+                            if remove_from_source:
+                                os.remove(self.path + file_nm)
+                        else:
+                            print('Failed to move file : ' + file_nm)
+                            success_files.remove(file)
+                elif trgt_loc == 's3':
+                    for file in files_to_move:
+                        s3_connection, trgt_bucket = trgt.get_s3_connection()
+                        file_nm = file.rpartition('/')[-1]
+                        f = open(self.path + file_nm, 'rb')
+                        s3_connection.upload_fileobj(f, trgt_bucket.rpartition('/')[-1], trgt_path + file_nm)
+                        lsize = s3_connection.head_object(Bucket=trgt_bucket.rpartition('/')[-1],
+                                                          Key=trgt_path + file_nm)['ContentLength']
+                        rsize = os.path.getsize(self.path + file_nm)
+                        # print(lsize, rsize)
+                        if lsize == rsize:
+                            if remove_from_source:
+                                os.remove(self.path + file_nm)
+                        else:
+                            print('Failed to move file : ' + file_nm)
+                            success_files.remove(file)
+                elif trgt_loc == 'sftp':
+                    for file in files_to_move:
+                        file_nm = file.rpartition('/')[-1]
+                        sftp_fs = trgt.get_sftp_filesys()
+                        sftp_fs.put(self.path + file_nm, trgt_path + file_nm)
+                        lsize = os.path.getsize(self.path + file_nm)
+                        rsize = sftp_fs.stat(trgt_path + file_nm).st_size
+                        if lsize == rsize:
+                            if remove_from_source:
+                                os.remove(self.path + file_nm)
+                        else:
+                            print('Failed to move file : ' + file_nm)
+                            success_files.remove(file)
+            return success_files, misc_file_list
+
+        except paramiko.SSHException as sshexception:
+            error = " ERROR MESSAGE: " + str(traceback.format_exc())
+            # self.execution_context.set_context({"traceback": error})
+            print(error)
+            raise sshexception
+
+        except Exception as exception:
+            error = " ERROR MESSAGE: " + str(traceback.format_exc())
+            # self.execution_context.set_context({"traceback": error})
+            print(error)
+            raise exception
+
+    @staticmethod
+    def _process_path(path, return_elements=False):
+        path = path.replace('\\', '/')
+        path_elements = path.split('/')
+        new_elements = path_elements
+        for ind, element in enumerate(path_elements):
+            if element == '.':
+                new_elements[ind] = None
+            elif element == '..':
+                new_elements[ind] = None
+                flag = False
+                for jnd in range(ind - 1, 0, -1):
+                    if new_elements[jnd] is not None:
+                        new_elements[jnd] = None
+                        flag = True
+                        break
+                if not flag:
+                    raise Exception('Root directory has no parent directory')
+            elif element == '':
+                if ind != 0:
+                    new_elements[ind] = None
+        new_elements = [x for x in new_elements if x is not None]
+        if return_elements:
+            return new_elements
+        clean_path = '/'.join(new_elements) + '/'
+        return clean_path
+
+    def list_dir(self, include_folders=False, return_date=False):
+        try:
+            if self.src_loc == 's3':
+                files = []
+                date = []
+                s3_connection, _bucket = self.get_s3_connection()
+                if 'Contents' in s3_connection.list_objects_v2(
+                        Bucket=self.credentials['bucket_name'].rpartition('/')[-1], Prefix=self.path):
+                    for file in \
+                            s3_connection.list_objects_v2(Bucket=self.credentials['bucket_name'].rpartition('/')[-1],
+                                                          Prefix=self.path)['Contents']:
+                        if not include_folders:
+                            if str(file['Key'].rpartition('/')[0]) == str(self.path.rpartition('/')[0]):
+                                if str(file['Key']) != self.path:
+                                    files.append(file['Key'])
+                                    if return_date:
+                                        date.append(file['LastModified'])
+                        else:
+                            print('FCM List Directory:' + str(file['Key']))
+                            if str(file['Key']).startswith(str(self.path)):
+                                if str(file['Key']) != self.path:
+                                    files.append(file['Key'])
+
+                    if return_date:
+                        return files, date
+                    return files
+                else:
+                    return files
+            elif self.src_loc == 'sftp':
+                files = self.fs.listdir(self.path)
+                if not return_date:
+                    return files
+                else:
+                    date = []
+                    for file in files:
+                        x = datetime.datetime.fromtimestamp(self.fs.stat(self.path + file).st_mtime)
+                        date.append(x.strftime('%Y-%m-%d %H:%M:%S'))
+                    return files, date
+            else:
+                files = os.listdir(self.path)
+                return files
+
+        except Exception as exception:
+            print(str(exception))
+            raise exception
+
+    def change_dir(self, path, absolute=False, inplace=True):
+        if inplace:
+            change_obj = self
+        else:
+            change_obj = FCM(self.wf_var, self.orig_src_loc, self.path)
+        if absolute:
+            change_obj.path = path
+        else:
+            change_obj.path += path
+        change_obj.path = FCM._process_path(change_obj.path)
+        if change_obj.src_loc == 'local':
+            change_obj.fs = pathlib.Path.home() / change_obj.path
+        return change_obj
+
+    def make_dir(self, structure):
+        if self.src_loc == 's3':
+            return
+        path_elements = FCM._process_path(self.path + structure, return_elements=True)
+        curr_path = ''
+        for element in path_elements:
+            curr_path += element + '/'
+            try:
+                if self.src_loc == 'local':
+                    if not os.path.isdir(curr_path):
+                        try:
+                            os.mkdir(curr_path)
+                        except FileExistsError as e:
+                            continue
+                elif self.src_loc == 'sftp':
+                    if not self.fs.isdir(curr_path):
+                        try:
+                            self.fs.mkdir(curr_path)
+                        except FileExistsError as e:
+                            continue
+            except Exception as e:
+                raise e
+
+    def remove_file(self, file_name, absolute=False):
+        if absolute:
+            file_to_delete = FCM._process_path(file_name)[:-1]
+        else:
+            file_to_delete = FCM._process_path(self.path + file_name)[:-1]
+
+        if self.src_loc == 's3':
+            self.fs.rm(self.credentials['bucket_name'] + '/' + file_to_delete)
+        elif self.src_loc == 'sftp':
+            self.fs.remove(file_to_delete)
+        elif self.src_loc == 'local':
+            pth = pathlib.Path(file_to_delete)
+            pth.unlink()
+
+
+def get_database():
+    db = spark_session.sql("show databases").toPandas()
+    db = db[db['databaseName'] != 'default']
+    print("Database : " + str(db['databaseName'][0]))
+    return db['databaseName'][0]
+
+
+def get_workflow_var():
+    workflow_var = spark_session.sql(f"select * from {database}.WORKFLOW_VARIABLES").toPandas()
+    workflow_var.columns = workflow_var.columns.str.upper()
+    return workflow_var  # we can return pd.series as well
+
+
+def writeinHIVE(data, tbl_nm, overwrite=False):
+    data = data.replace([None], ['NULL']).replace([np.NaN], ['NULL'])
+    data_sparkDF = spark_session.createDataFrame(data)
+    data_sparkDF = data_sparkDF.replace(['NULL'], [None]).replace(['Non'], [None]).replace([''], [None]).replace(
+        ['None'], [None])
+    spark_session.sql("SET spark.sql.hive.convertMetastoreParquet=false")
+    data_sparkDF.write.insertInto(tbl_nm, overwrite=overwrite)
+
+
+def check_file_name(fcm, src_mast_row):
+    # if src_mast_row['DATE_FORMAT'] is None:
+    #     print(f"DATE_FORMAT is not configured for {src_mast_row['SRC_MAST_ID']}")
+    #     return "FAILED"
+
+    try:
+        files = []
+        f_names = fcm.find(srch_pttrn=src_mast_row['I_SRCH_PTRN'] + src_mast_row['I_EXTNSN'],
+                           date_format=src_mast_row['DATE_FORMAT'], return_all=True)
+        if isinstance(f_names, str):
+            files.append(f_names.rpartition('/')[-1])
+        elif isinstance(f_names, list):
+            files = [x.rpartition('/')[-1] for x in f_names]
+
+        if len(files) == 0:
+            return 'FAILED', []
+
+        return 'SUCCESS', files
+    except Exception as e:
+        warn_msg = repr(e)
+        import traceback
+        print(traceback.format_exc())
+        return 'FAILED', []
+
+
+def header_check(status, fcm, src_mast_row, file_nm):
+    try:
+        warn_msg = ''
+        phi_config = spark_session.sql(
+            f"""select * from {database}.CNTL_PHI_CONFIG where SRC_MAST_ID = '{src_mast_row["SRC_MAST_ID"]}' 
+                                            and ACTIVE_FLAG=1 and INP_ORDR is not NULL order by INP_ORDR """).toPandas()
+        phi_config.columns = phi_config.columns.str.upper()
+        col_list_file = []
+        for chunk in fcm.read(srch_pttrn=file_nm,
+                              dlmtr=src_mast_row['I_DELIMITER'], sht_nm=src_mast_row['I_SHT_NM'],
+                              txt_qlfr=src_mast_row['TXT_QLFR'], date_format=src_mast_row['DATE_FORMAT'],
+                              row_level_read=True, encoding=src_mast_row['I_FILE_ENCDNG']):
+            if type(chunk) is str:
+                print(chunk)
+                col_list_file = []
+                header = ''
+                quoted = False
+                for ch in chunk:
+                    if ch == src_mast_row['I_DELIMITER']:
+                        if quoted:
+                            header += ch
+                        else:
+                            print(header)
+                            col_list_file.append(header)
+                            header = ''
+                    elif ch == src_mast_row['TXT_QLFR']:
+                        quoted = not quoted
+                    else:
+                        header += ch
+                header = header.replace('\r', '').replace('\n', '')
+                col_list_file.append(header)
+            else:
+                col_list_file = chunk.columns.tolist()
+            break
+        col_list_file = [column.strip() for column in col_list_file]
+        if src_mast_row['I_HEADER']:
+            out_of_order = False
+            tmp = col_list_file
+            for ind, row in phi_config.iterrows():
+                col_nm = row['COL_NM_FILE']
+                if col_nm != col_list_file[0]:
+                    if col_nm in col_list_file:
+                        out_of_order = True
+                        col_list_file.remove(col_nm)
+                        status = 'WARNING'
+                    else:
+                        status = 'FAILED'
+                        warn_msg += ' No column ' + col_nm + ' in file ' + file_nm
+                        print(warn_msg)
+                        return tmp, status, warn_msg
+                else:
+                    col_list_file.remove(col_nm)
+            if out_of_order:
+                warn_msg += ' Out of order columns in file ' + file_nm
+                print(warn_msg)
+            if len(col_list_file) != 0:
+                status = 'WARNING'
+                warn_msg += ' ' + str(len(col_list_file)) + ' extra columns present in file ' + file_nm
+                print(warn_msg)
+                return col_list_file, status, warn_msg
+            return tmp, status, warn_msg
+        else:
+            if len(phi_config) == len(col_list_file):
+                return col_list_file, status, warn_msg
+            else:
+                status = 'FAILED'
+                warn_msg += ' Number of columns in file inconsistent with CNTL_PHI_CONFIG'
+                print(warn_msg)
+                return col_list_file, status, warn_msg
+    except Exception as e:
+        raise e
+
+
+def reorder_header(fcm, src_mast_row, file_nm):
+    phi_config = spark_session.sql(
+        f"""select * from {database}.CNTL_PHI_CONFIG where SRC_MAST_ID = '{src_mast_row["SRC_MAST_ID"]}' 
+                                            and ACTIVE_FLAG=1 and INP_ORDR is not NULL order by INP_ORDR """).toPandas()
+    phi_config.columns = phi_config.columns.str.upper()
+    data_lst = []
+    if src_mast_row['I_HEADER']:
+        header = 'infer'
+        header_write = True
+    else:
+        header = None
+        header_write = None
+    for data in fcm.read(srch_pttrn=file_nm, dlmtr=src_mast_row['I_DELIMITER'],
+                         txt_qlfr=src_mast_row['TXT_QLFR'], date_format=src_mast_row['DATE_FORMAT'],
+                         encoding=src_mast_row['I_FILE_ENCDNG'], header=header):
+        data_new = pd.DataFrame(columns=phi_config['COL_NM_FILE'].tolist(), index=data.index)
+        for col in phi_config['COL_NM_FILE'].tolist():
+            data_new[col] = data[col]
+        data_lst.append(data_new)
+
+    full_data = pd.concat(data_lst, ignore_index=True)
+    full_data = full_data.replace([np.NaN], [None])
+    fcm.remove_file(file_nm)
+    fcm.write(file_nm, full_data, src_mast_row['I_DELIMITER'], src_mast_row['I_SHT_NM'], src_mast_row['TXT_QLFR'],
+              mode='w',
+              header=header_write)
+
+
+def dlmtr_txt_qlfr_check(status, fcm_org, src_mast_row, file_nm):
+    xtnsn = src_mast_row['I_EXTNSN']
+    fcm = fcm_org.change_dir('.', inplace=False)
+    err_rows = {}
+    if xtnsn == '.txt' or xtnsn == '.csv' or xtnsn == '.TXT':
+        from queue import Queue
+        from threading import Thread
+
+        def _execute(queue, er_tq, er_dl, numpipes, encode):
+            while True:
+                try:
+                    _fcm = fcm_org.change_dir('.', inplace=False)
+                    work = queue.get()
+                    if work is None:
+                        break
+                    try:
+                        row_read = 0
+                        for line in _fcm.read(srch_pttrn=file_nm,
+                                              date_format=src_mast_row['DATE_FORMAT'], row_level_read=True,
+                                              skip_row=work[0], encoding=encode):
+                            curr_pipe = 0
+                            txt_qlfr = False
+                            for ch in line:
+                                if ch == src_mast_row['I_DELIMITER']:
+                                    if not txt_qlfr:
+                                        curr_pipe += 1
+                                if ch == src_mast_row['TXT_QLFR']:
+                                    txt_qlfr = not txt_qlfr
+                            if txt_qlfr:
+                                er_tq.append(work[0] + row_read)
+                            if curr_pipe != numpipes:
+                                er_dl.append(work[0] + row_read)
+                            row_read += 1
+                            if row_read == work[1]:
+                                break
+                    except Exception as e:
+                        raise e
+                    finally:
+                        queue.task_done()
+                except Exception as e:
+                    raise e
+
+        def rangit(num_threads, extras, chunk):
+            skip = 1
+            for thread in range(1, num_threads + 1):
+                if thread <= extras:
+                    yield (skip, chunk + 1)
+                    skip += chunk + 1
+                else:
+                    yield (skip, chunk)
+                    skip += chunk
+
+        from pandas.errors import ParserError
+        errors_present = False
+        count = 0
+        try:
+            if src_mast_row['I_HEADER']:
+                header = 'infer'
+            else:
+                header = None
+            for chunk in fcm.read(srch_pttrn=file_nm, dlmtr=src_mast_row['I_DELIMITER'],
+                                  sht_nm=src_mast_row['I_SHT_NM'],
+                                  txt_qlfr=src_mast_row['TXT_QLFR'], date_format=src_mast_row['DATE_FORMAT'],
+                                  encoding=src_mast_row['I_FILE_ENCDNG'], header=header):
+                count += len(chunk)
+        except ParserError as e:
+            errors_present = True
+        # if not errors_present:
+        #     err_rows['dlmtr'] = []
+        #     err_rows['qlfr'] = []
+        #     return {'status': 'SUCCESS', 'rows': err_rows, 'ttl': count}
+        count = -1
+        first_row = True
+        pipes = 0
+        for line in fcm.read(srch_pttrn=file_nm,
+                             date_format=src_mast_row['DATE_FORMAT'],
+                             row_level_read=True, encoding=src_mast_row['I_FILE_ENCDNG']):
+            if first_row:
+                first_row = False
+                for ch in line:
+                    if ch == src_mast_row['I_DELIMITER']:
+                        pipes += 1
+            count += 1
+        if count == 0:
+            err_rows['dlmtr'] = []
+            err_rows['qlfr'] = []
+            return {'status': 'SUCCESS', 'rows': err_rows, 'ttl': count}
+        encoding = fcm.encoding
+        q = Queue()
+        num_threads = min(4, count)
+        threads = []
+        er_qlfr = []
+        er_dlmtr = []
+        for i in range(num_threads):
+            worker = Thread(target=_execute, args=(q, er_qlfr, er_dlmtr, pipes, encoding))
+            worker.start()
+            threads.append(worker)
+        for i, j in rangit(num_threads, count % num_threads, int(count / num_threads)):
+            q.put((i, j))
+        q.join()
+        for i in range(num_threads):
+            q.put(None)
+        for t in threads:
+            t.join()
+        err_rows['dlmtr'] = er_dlmtr
+        err_rows['qlfr'] = er_qlfr
+        if len(er_dlmtr) == 0 and len(er_qlfr) == 0:
+            return {'status': 'SUCCESS', 'rows': err_rows, 'ttl': count}
+        else:
+            return {'status': 'FAILED', 'rows': err_rows, 'ttl': count}
+    else:
+        warn_msg = f" Delimiter and Text qualifier checks can't be done on non-flat files. File Name: {file_nm} "
+        print(warn_msg)
+        return {'status': 'WARNING', 'rows': err_rows, 'warn_msg': warn_msg}
+
+
+def preprocess(src_mast_id, wf_var):
+    try:
+        status = 'RUNNING'
+        src_mast_row = spark_session.sql(
+            f"select * from {database}.CNTL_SRC_MAST where SRC_MAST_ID = '{src_mast_id}' /*and ACTIVE_FLAG=1*/ ").toPandas().iloc[
+                       0, :]
+        src_mast_row.index = src_mast_row.index.str.upper()
+        files = [src_mast_row['I_SRCH_PTRN'] + src_mast_row['I_EXTNSN'], ]
+        # insert_dq_log = f"INSERT INTO TABLE {database}.DQ_LOGGER (cycl_time_id, scen_id, dtst_id, src_mast_id, source_name, check_type, ctgry, status, log_msg, load_dt) "\
+        #                    + f"VALUES ({wf_var['CYCL_TIME_ID'][0]}, {wf_var['SCEN_ID'][0]}, {wf_var['DTST_ID'][0]}, '{src_mast_id}', "\
+        #                     + "'{SOURCE_NAME}', '{CHECK_TYPE}', 'PREPROCESSING', '{STATUS}', '{LOG_MSG}', '{LOAD_DT}')"
+        insert_dq_log = f"INSERT INTO TABLE {database}.DQ_LOGGER VALUES ({wf_var['CYCL_TIME_ID'][0]}, {wf_var['SCEN_ID'][0]}, {wf_var['DTST_ID'][0]}, '{src_mast_id}', " \
+                        + "NULL, '{SOURCE_NAME}', NULL, '{CHECK_TYPE}', NULL, NULL, 'PREPROCESSING', '{STATUS}', '{LOG_MSG}', '{LOAD_DT}')"
+        files_failed = []
+        files_passed = []
+        # fcm = FCM(wf_var,'ps3','phi/10_Inbound/')
+        fcm = FCM(wf_var, src_mast_row['PHI_ENV_LOC'], src_mast_row['LND_PATH'])
+        sub_path = f"{src_mast_row['DTST_NM']}/{wf_var['CYCL_TIME_ID'][0]}/{wf_var['SCEN_ID'][0]}/"
+        fcm.change_dir(sub_path)
+        print(fcm.path)
+
+        checks = ['FILE_NAME_CHECK', 'HEADER_CHECK', 'DELIMITER_CHECK',
+                  'TEXT_QUALIFIER_CHECK']  # Will Take from HIVE TBL
+        if checks is not None:
+            check_types = spark_session.sql(
+                f"""select QC_TYPE_ID, QC_TYPE_NAME from {database}.QC_TYPE where QC_CTGRY='PREPROCESSING'""").toPandas()
+            # do_next_check = True
+            # txt_qlfr_result = None
+            # txt_qlfr_ttl = None
+            # file_name_check_done = False
+
+            '''*FILE_NAME_CHECK MANDETORY*'''
+            status, files = check_file_name(fcm, src_mast_row)
+            if status == 'SUCCESS':
+                spark_session.sql(
+                    insert_dq_log.format(SOURCE_NAME=src_mast_row['I_SRCH_PTRN'] + src_mast_row['I_EXTNSN'],
+                                         CHECK_TYPE="FILE_NAME_CHECK", STATUS=status,
+                                         LOG_MSG='', LOAD_DT=str(datetime.now())[:-7]))
+                print(f"FILE_NAME_CHECK is got success for {src_mast_row['I_SRCH_PTRN']}")
+            if status == 'FAILED':
+                if src_mast_row['DATE_FORMAT'] is None:
+                    date_format = ''
+                else:
+                    date_format = src_mast_row['DATE_FORMAT']
+                err_msg = f"No file present at {src_mast_row['LND_PATH']} with search pattern: {src_mast_row['I_SRCH_PTRN'] + src_mast_row['I_EXTNSN']} and dateformat: {date_format}"
+                spark_session.sql(
+                    insert_dq_log.format(SOURCE_NAME=src_mast_row['I_SRCH_PTRN'] + src_mast_row['I_EXTNSN'],
+                                         CHECK_TYPE="FILE_NAME_CHECK", STATUS=status,
+                                         LOG_MSG=err_msg, LOAD_DT=str(datetime.now())[:-7]))
+                print(err_msg)
+                print(f"""\n FILE_NAME_CHECK got failed for {fcm.path} with date format of '{date_format}' """)
+                return
+
+            for file in files:
+                status = 'SUCCESS'
+                do_next_check = True
+                header_check_failed = False
+                dlmtr_txt_qlfr_result = None
+                log_msg = ''
+                spark_session.sql(insert_dq_log.format(SOURCE_NAME=file, CHECK_TYPE="FILE_NAME_CHECK", STATUS=status,
+                                                       LOG_MSG=log_msg, LOAD_DT=str(datetime.now())[:-7]))
+                for check_name in CHECKS_IN_ORDER:
+                    if do_next_check:
+                        for ind, check_type in check_types[
+                            check_types['QC_TYPE_NAME'].str.contains(check_name)].iterrows():
+                            # for check_name in checks:
+                            '''
+                            if check_name == 'FILE_NAME_CHECK' and (not file_name_check_done):
+                                status, files = check_file_name(fcm, src_mast_row)
+                                file_name_check_done = True
+                                if status == 'SUCCESS':
+                                    print(f"FILE_NAME_CHECK is got success for {src_mast_row['I_SRCH_PTRN']}")
+                                if status == 'FAILED':
+                                    if src_mast_row['DATE_FORMAT'] is None:
+                                        date_format = ''
+                                    else:
+                                        date_format = src_mast_row['DATE_FORMAT']
+                                    print(f"""\n FILE_NAME_CHECK got failed for {src_mast_row['I_SRCH_PTRN']} with date format of '{date_format}' """)
+                            '''
+                            if check_name == 'HEADER_CHECK':
+                                col_list_file, status, log_msg = header_check(status, fcm, src_mast_row, file)
+                                if status == 'SUCCESS':
+                                    print(f"HEADER_CHECK is got success for {file}")
+                                    spark_session.sql(
+                                        insert_dq_log.format(SOURCE_NAME=file, CHECK_TYPE="HEADER_CHECK", STATUS=status,
+                                                             LOG_MSG=log_msg, LOAD_DT=str(datetime.now())[:-7]))
+                                if status != 'SUCCESS':
+                                    # status = 'FAILED'
+                                    header_check_failed = True
+                                    log_msg += " Columns in file -- " + ','.join(col_list_file)
+                                    spark_session.sql(
+                                        insert_dq_log.format(SOURCE_NAME=file, CHECK_TYPE="HEADER_CHECK", STATUS=status,
+                                                             LOG_MSG=log_msg, LOAD_DT=str(datetime.now())[:-7]))
+                                    print(log_msg)
+                                    print(
+                                        f"""\n HEADER_CHECK got {status} for {file}. For Columns in file -- {','.join(col_list_file)}' """)
+                            elif check_name == 'DELIMITER_CHECK':
+                                if dlmtr_txt_qlfr_result is None:
+                                    dlmtr_txt_qlfr_result = dlmtr_txt_qlfr_check(status, fcm, src_mast_row, file)
+                                # dlmtr_txt_qlfr_result = dlmtr_txt_qlfr_check(status, fcm, src_mast_row, file)
+                                print(dlmtr_txt_qlfr_result)
+                                if dlmtr_txt_qlfr_result['status'] == 'WARNING':
+                                    status = dlmtr_txt_qlfr_result['status']
+                                    spark_session.sql(
+                                        insert_dq_log.format(SOURCE_NAME=file, CHECK_TYPE="DELIMITER_CHECK",
+                                                             STATUS=status,
+                                                             LOG_MSG=dlmtr_txt_qlfr_result['warn_msg'],
+                                                             LOAD_DT=str(datetime.now())[:-7]))
+                                elif len(dlmtr_txt_qlfr_result['rows']['dlmtr']) > 0:
+                                    status = dlmtr_txt_qlfr_result['status']
+                                    log_msg = ' Delimiter error in ' + str(
+                                        len(dlmtr_txt_qlfr_result['rows']['dlmtr'])) + ' rows. '
+                                    print(log_msg)
+                                    spark_session.sql(
+                                        insert_dq_log.format(SOURCE_NAME=file, CHECK_TYPE="DELIMITER_CHECK",
+                                                             STATUS=status,
+                                                             LOG_MSG=log_msg, LOAD_DT=str(datetime.now())[:-7]))
+                                else:
+                                    status = 'SUCCESS'
+                                    spark_session.sql(
+                                        insert_dq_log.format(SOURCE_NAME=file, CHECK_TYPE="DELIMITER_CHECK",
+                                                             STATUS=status,
+                                                             LOG_MSG='', LOAD_DT=str(datetime.now())[:-7]))
+                                    print(f"DELIMITER_CHECK is got success for {file}")
+                                # txt_qlfr_result = result['rows']['qlfr']
+                                # txt_qlfr_ttl = result['ttl']
+                            elif check_name == 'TEXT_QUALIFIER_CHECK':
+                                if dlmtr_txt_qlfr_result is None:
+                                    dlmtr_txt_qlfr_result = dlmtr_txt_qlfr_check(status, fcm, src_mast_row, file)
+                                    # txt_qlfr_result = result['rows']['qlfr']
+
+                                if dlmtr_txt_qlfr_result['status'] == 'WARNING':
+                                    status = dlmtr_txt_qlfr_result['status']
+                                    spark_session.sql(
+                                        insert_dq_log.format(SOURCE_NAME=file, CHECK_TYPE="TEXT_QUALIFIER_CHECK",
+                                                             STATUS=status,
+                                                             LOG_MSG=dlmtr_txt_qlfr_result['warn_msg'],
+                                                             LOAD_DT=str(datetime.now())[:-7]))
+                                elif len(dlmtr_txt_qlfr_result['rows']['qlfr']) > 0:
+                                    status = dlmtr_txt_qlfr_result['status']
+                                    log_msg = 'Text Qualifier error in ' + str(
+                                        len(dlmtr_txt_qlfr_result['rows']['qlfr'])) + ' rows. '
+                                    print(log_msg)
+                                    spark_session.sql(
+                                        insert_dq_log.format(SOURCE_NAME=file, CHECK_TYPE="TEXT_QUALIFIER_CHECK",
+                                                             STATUS=status,
+                                                             LOG_MSG=log_msg, LOAD_DT=str(datetime.now())[:-7]))
+                                else:
+                                    status = 'SUCCESS'
+                                    print(f"TEXT_QUALIFIER_CHECK is got success for {file}")
+                                    spark_session.sql(
+                                        insert_dq_log.format(SOURCE_NAME=file, CHECK_TYPE="TEXT_QUALIFIER_CHECK",
+                                                             STATUS=status,
+                                                             LOG_MSG='', LOAD_DT=str(datetime.now())[:-7]))
+                                # txt_qlfr_result = None
+                                # txt_qlfr_ttl = None
+                            else:
+                                raise Exception('CHECK NOT SUPPORTED')
+                            if status == 'FAILED':
+                                # if check_name != 'DELIMITER_CHECK':
+                                files_failed.append(file)
+                                print(f" {file} is added in files_failed")
+                                do_next_check = False
+
+                if file not in files_failed:
+                    if header_check_failed:
+                        try:
+                            reorder_header(fcm, src_mast_row, file)
+                        except Exception as e:
+                            error = " ERROR MESSAGE: " + str(traceback.format_exc())
+                            print(error)
+                            raise e
+                    spark_session.sql(
+                        insert_dq_log.format(SOURCE_NAME=file, CHECK_TYPE="RECORD_COUNT", STATUS='SUCCESS',
+                                             LOG_MSG=dlmtr_txt_qlfr_result['ttl'], LOAD_DT=str(datetime.now())[:-7]))
+                    files_passed.append(file)
+                    print(f" {file} is added in files_passed")
+                print(f"Final Status for {file}: {status}")
+
+        if checks is None:
+            files_passed = files
+            print(status)
+            status = 'SUCCESS'
+
+        '''
+        if (status == 'SUCCESS' or status == 'WARNING') or checks is None:
+            trgt = fcm.change_dir(src_mast_row['STG_PATH'], absolute=True, inplace=False)
+        else:
+            trgt = fcm.change_dir(src_mast_row['RJCT_PATH'], absolute=True, inplace=False)
+
+        trgt.make_dir(sub_path) #Need to add
+        trgt.change_dir(sub_path)
+        succesful, misc_files = fcm.move(file_nm_pttrn=src_mast_row['I_SRCH_PTRN'] + src_mast_row['I_EXTNSN'],
+                        date_format=src_mast_row['DATE_FORMAT'], trgt=trgt, remove_from_source=True)
+        '''
+        if len(files_passed) == 0:
+            print(f" No file is passed/present for {src_mast_row['I_SRCH_PTRN']}")
+        else:
+            trgt = fcm.change_dir(src_mast_row['STG_PATH'], absolute=True, inplace=False)
+            trgt.make_dir(sub_path)
+            trgt.change_dir(sub_path)
+            succesful, misc_files = fcm.move(file_nm_pttrn=files_passed,
+                                             date_format=src_mast_row['DATE_FORMAT'], trgt=trgt,
+                                             remove_from_source=True)
+            if len(succesful) == 0:
+                raise Exception('Failed to move file STG_PATH. See logs for details.')
+            if len(misc_files) != 0:
+                warn_msg = 'Following file moved to misc in STG_PATH because of file name conflicts : ' + ','.join(
+                    misc_files)
+                print(warn_msg)
+                status = 'WARNING'
+
+        if len(files_failed) > 0:
+            trgt = fcm.change_dir(src_mast_row['RJCT_PATH'], absolute=True, inplace=False)
+            trgt.make_dir(sub_path)
+            trgt.change_dir(sub_path)
+            succesful, misc_files = fcm.move(file_nm_pttrn=files_failed,
+                                             date_format=src_mast_row['DATE_FORMAT'], trgt=trgt,
+                                             remove_from_source=True)
+            if len(succesful) == 0:
+                raise Exception('Failed to move files to RJCT_PATH. See logs for details.')
+            if len(misc_files) != 0:
+                warn_msg = 'Following file moved to misc in RJCT_PATH because of file name conflicts : ' + ','.join(
+                    misc_files)
+                print(warn_msg)
+                status = 'WARNING'
+
+        if len(files_failed) > 0:
+            warn_msg = ' CHECK DETAILS IN QC_LOG AND QC_ERR_DTL.'
+            print(warn_msg)
+    except Exception as e:
+        status = 'FAILED'
+        warn_msg = repr(e)
+        print(warn_msg)
+        raise e
+
+
+os.environ['SPARK_HOME'] = "/usr/lib/spark/"
+os.environ['PYSPARK_PYTHON'] = "python3"
+sys.path.append("/usr/lib/spark/python/")
+from pyspark.sql import *
+
+spark_params = get_spark_parameters()
+
+spark_session = (SparkSession.builder
+                 .appName("Pre_Processing")
+                 .config("spark.executor.instances", spark_params['executor_instances'])
+                 .config("spark.executor.cores", spark_params['executor_cores'])
+                 .config("spark.executor.memory", spark_params['executor_memory'])
+                 .config("spark.sql.shuffle.partitions", spark_params['shuffle_partitions'])
+                 .config("spark.driver.memory", spark_params['driver_memory'])
+                 .config("spark.yarn.executor.memoryOverhead", spark_params['executor_memory_overhead'])
+                 .enableHiveSupport()
+                 .getOrCreate())
+
+database = get_database()
+wf_var = get_workflow_var()
+table_list = wf_var["SRC_MAST_ID"][0].split(",")
+table_list = [i.upper().replace("STG_", "").replace("LND_", "").strip() for i in table_list]
+CHECKS_IN_ORDER = ['HEADER_CHECK', 'DELIMITER_CHECK', 'TEXT_QUALIFIER_CHECK']  # 'SHEET_NAME_CHECK', 'FILE_NAME_CHECK',
+
+for src_mast_id in table_list:
+    print(f"Started for {src_mast_id}")
+    preprocess(src_mast_id, wf_var)
